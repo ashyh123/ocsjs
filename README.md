@@ -20,4 +20,6 @@
 
 ## 官网及教程 [https://docs.ocsjs.com](https://docs.ocsjs.com)
 
+本 fork 的超星视频 Agent 开发版：构建、安装、结构化状态、课程记忆及验证范围见 [Agent 使用说明](docs/agent.md)。
+
 </div>

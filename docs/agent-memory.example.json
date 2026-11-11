@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"revision": 0,
+	"updatedAt": 0,
+	"course": {
+		"courseId": "example-course-id",
+		"clazzId": "example-class-id",
+		"title": "示例结构：尚未观察真实课程"
+	},
+	"catalog": {
+		"status": "unknown",
+		"observedAt": 0,
+		"observedTaskIds": [],
+		"chapters": []
+	},
+	"tasks": [],
+	"navigation": {
+		"version": 1,
+		"strategy": "chapter_id_click_then_inspect",
+		"targets": []
+	},
+	"checkpoint": {
+		"taskId": null,
+		"phase": "not_started",
+		"updatedAt": 0
+	},
+	"summary": {
+		"videoScopeStatus": "unknown",
+		"confirmedTaskIds": [],
+		"unconfirmedTaskIds": [],
+		"courseAllTasksStatus": "not_assessed"
+	}
+}
