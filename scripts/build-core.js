@@ -167,6 +167,8 @@ async function createUserJs() {
 	console.log('createMetaFile: ', path.join(distResolvedPath, 'ocs.meta.js'));
 	await createMetaFile({ dist: officialOpts.dist, metaDist: path.join(distResolvedPath, 'ocs.meta.js') });
 
+	await require('./build-agent').buildAgent(distResolvedPath);
+
 	/** 创建调试脚本 */
 	await createDevUserScript();
 
