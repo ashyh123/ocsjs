@@ -56,3 +56,5 @@ npm run test:agent:browser
 浏览器验证使用本机 Chromium（默认 `/usr/bin/chromium`，可用 `CHROMIUM_PATH` 指定）、本地媒体与模拟超星页面，覆盖播放控制、平台完成确认、切章、跨来源 iframe 和刷新后记忆恢复。测试模拟脚本管理器 API。
 
 这些测试不证明真实账号、真实课程、Egolite 或具体脚本管理器版本已经兼容。首次实机联调需要检查 userscript 沙盒桥接、实际 DOM 和学校域名。登录或人脸验证返回等待状态，由用户完成后继续。
+
+使用 [Pi Durable 单视频工作流](../packages/durable/README.md) 可以运行一个已选定的超星视频，并在本地运行器中断后恢复同一任务。
