@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
 import { createEgoBrowser } from './browser.mjs';
-import { createDiagnosis } from './diagnosis.mjs';
+import { createRecovery } from './recovery.mjs';
 import { bindVideo, openWorkflow } from './workflow.mjs';
 
 const usage = `用法
@@ -76,7 +76,7 @@ async function main() {
 	process.once('SIGINT', stop);
 	process.once('SIGTERM', stop);
 	try {
-		workflow = await openWorkflow(path, { browser, diagnose: createDiagnosis(), onStatus: print, readOnly });
+		workflow = await openWorkflow(path, { browser, selectRecovery: createRecovery(), onStatus: print, readOnly });
 		if (interrupted) return;
 		if (readOnly) {
 			print(await workflow.status());

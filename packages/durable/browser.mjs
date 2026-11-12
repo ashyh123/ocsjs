@@ -4,6 +4,9 @@ const RESULT_PREFIX = 'OCS_DURABLE_BROWSER_RESULT ';
 const OPERATION_TIMEOUT_MS = 25_000;
 const KILL_GRACE_MS = 750;
 const MAX_OUTPUT = 512 * 1024;
+const MAX_RECOVERY_CANDIDATES = 20;
+const RECOVERY_CANDIDATE_ID = /^[a-f0-9]{64}$/;
+const CHAPTER_ID = /^[a-zA-Z0-9_-]{1,128}$/;
 
 const BROWSER_PROGRAM = String.raw`
 function addressState(url) {
@@ -22,7 +25,7 @@ function addressState(url) {
   return courseDomain ? null : { kind: 'user', reason: 'wrong_course_page' };
 }
 
-async function observeCourse({ operation, target }) {
+async function observeCourse({ operation, target, candidateId, maxRecoveryCandidates }) {
   const observedUrl = location.href;
   const hostname = location.hostname;
   if (/^passport\d*\.chaoxing\.com$/.test(hostname) ||
@@ -36,13 +39,22 @@ async function observeCourse({ operation, target }) {
   }
   if (!navigator.onLine) return { kind: 'wait', reason: 'network_offline' };
 
-  const courseLink = [...document.querySelectorAll('a')].find((link) => link.textContent.includes('返回课程'));
-  const enrollment = new URL(observedUrl).searchParams.get('cpi') ||
-    (courseLink && new URL(courseLink.href, observedUrl).searchParams.get('cpi'));
-  const enrollmentKey = enrollment
-    ? Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(enrollment))),
-      (value) => value.toString(16).padStart(2, '0')).join('')
-    : undefined;
+  const readEnrollment = () => {
+    const routeEnrollment = new URL(observedUrl).searchParams.get('cpi');
+    if (routeEnrollment) return routeEnrollment;
+    const courseLink = [...document.querySelectorAll('a')].find((link) => link.textContent.includes('返回课程'));
+    const href = courseLink?.getAttribute('href');
+    if (href && URL.canParse(href, courseLink.ownerDocument.baseURI)) {
+      return new URL(href, courseLink.ownerDocument.baseURI).searchParams.get('cpi');
+    }
+    return undefined;
+  };
+  const enrollment = readEnrollment();
+  const digest = async (text) => Array.from(
+    new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))),
+    (value) => value.toString(16).padStart(2, '0')
+  ).join('');
+  const enrollmentKey = enrollment ? await digest(enrollment) : undefined;
   if (target.enrollmentKey && target.enrollmentKey !== enrollmentKey) {
     return { kind: 'user', reason: 'course_enrollment_changed' };
   }
@@ -55,6 +67,56 @@ async function observeCourse({ operation, target }) {
   }
 
   const activeStates = ['starting', 'running', 'paused', 'waiting_for_user', 'awaiting_confirmation'];
+  const readParam = (url, ...names) => {
+    const matches = [...url.searchParams].filter(([key]) => names.includes(key.toLowerCase()));
+    if (matches.length > 1) return undefined;
+    return matches[0]?.[1] ?? null;
+  };
+  const chapterPattern = /^[a-zA-Z0-9_-]{1,128}$/;
+  const activeChapter = () => {
+    const ids = new Set([...document.querySelectorAll('.posCatalog_active[id^="cur"]')]
+      .map((element) => element.id.slice(3)).filter((id) => chapterPattern.test(id)));
+    if (ids.size) return ids.size === 1 ? [...ids][0] : null;
+    const chapterId = readParam(new URL(observedUrl), 'chapterid', 'knowledgeid');
+    return chapterId && chapterPattern.test(chapterId) ? chapterId : null;
+  };
+  const playerRoute = (url) => url.protocol === 'https:' && !url.port && !url.username && !url.password &&
+    ['mooc1.chaoxing.com', 'mooc1-1.chaoxing.com', 'mooc2-ans.chaoxing.com'].includes(url.hostname) &&
+    /^\/(?:mooc(?:2)?-ans\/)?mycourse\/studentstudy\/?$/.test(url.pathname);
+  const visible = (element) => element.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ??
+    (element.getClientRects().length > 0 && element.ownerDocument.defaultView?.getComputedStyle(element).visibility === 'visible');
+  const recoveryLink = (link) => {
+    const href = link.getAttribute('href')?.trim();
+    const destination = link.getAttribute('target')?.toLowerCase() ?? '';
+    if (!href || !visible(link) || !['', '_self', '_top'].includes(destination) ||
+        !URL.canParse(href, link.ownerDocument.baseURI)) return null;
+    const url = new URL(href, link.ownerDocument.baseURI);
+    if (!playerRoute(url) || url.hash || url.href === observedUrl ||
+        readParam(url, 'courseid') !== target.courseId || readParam(url, 'clazzid', 'classid') !== target.clazzId ||
+        readParam(url, 'cpi') !== enrollment) return null;
+    const chapterId = readParam(url, 'chapterid', 'knowledgeid');
+    if (chapterId !== null && (chapterId !== target.chapterId || !chapterPattern.test(chapterId))) return null;
+    const title = [link.innerText, link.getAttribute('aria-label'), link.getAttribute('title')].find((value) => value?.trim())
+      ?.replace(/(?:https?:\/\/|www\.)\S+|\S*[?&][a-z0-9_%.-]+=\S*|\b[a-z][a-z0-9_%.-]*=\S*/gi, '')
+      .replace(/\s+/g, ' ').trim().slice(0, 160);
+    return title ? { href: url.href, title, chapterId } : null;
+  };
+  const recoveryLinks = () => {
+    const links = new Map();
+    const visit = (doc) => {
+      for (const link of doc.querySelectorAll('a[href]:not([onclick]):not([download]):not([aria-disabled="true"])')) {
+        const candidate = recoveryLink(link);
+        if (candidate && !links.has(candidate.href)) links.set(candidate.href, candidate);
+      }
+      for (const frame of doc.querySelectorAll('iframe')) {
+        const child = frame.contentDocument;
+        if (child?.location?.origin === location.origin && visible(frame)) visit(child);
+      }
+    };
+    visit(document);
+    return [...links.values()].sort((a, b) =>
+      Number(b.chapterId === target.chapterId) - Number(a.chapterId === target.chapterId));
+  };
   const verify = (view) => {
     const observation = view?.observation;
     if (!observation || !Array.isArray(observation.tasks) || !Array.isArray(view.frames) ||
@@ -68,6 +130,23 @@ async function observeCourse({ operation, target }) {
       observation.course.courseId !== target.courseId || observation.course.clazzId !== target.clazzId
     )) {
       return { kind: 'user', reason: 'course_identity_changed' };
+    }
+    return null;
+  };
+  const verifyNavigation = (view) => {
+    if (target.enrollmentKey && readEnrollment() !== enrollment) {
+      return { kind: 'user', reason: 'course_enrollment_changed' };
+    }
+    if (!view.observation.course || view.unavailableFrames.length > 0) {
+      return { kind: 'wait', reason: 'course_frames_unavailable' };
+    }
+    if (view.frames.some(({ status }) => activeStates.includes(status.state))) {
+      return { kind: 'user', reason: 'another_course_task_active' };
+    }
+    if (view.observation.blockedReason) return { kind: 'user', reason: 'course_navigation_blocked' };
+    if (view.observation.tasks.some((task) => task.id === target.taskId && task.chapterId === target.chapterId &&
+        (task.availability === 'executable' || task.platformStatus === 'confirmed'))) {
+      return { kind: 'wait', reason: 'target_task_reappeared' };
     }
     return null;
   };
@@ -85,6 +164,7 @@ async function observeCourse({ operation, target }) {
         version: view.version,
         contextId: view.contextId,
         observedAt: view.observedAt,
+        activeChapterId: activeChapter(),
         observation: safeObservation(view.observation),
         frames: view.frames.map(({ contextId, observation, status }) => ({
           contextId,
@@ -103,6 +183,39 @@ async function observeCourse({ operation, target }) {
   if (issue) return issue;
   if (operation === 'inspect' || operation === 'afterRefresh') return observed(before);
 
+  if (operation === 'openChapter' || operation === 'discoverRecovery' || operation === 'followRecovery') {
+    const navigationIssue = verifyNavigation(before);
+    if (navigationIssue) return navigationIssue;
+    if (operation === 'openChapter') {
+      if (activeChapter() === target.chapterId) return { kind: 'unexpected', reason: 'target_chapter_already_open' };
+      if (typeof agent.openChapter !== 'function' ||
+          !before.observation.chapters?.some((chapter) => chapter.id === target.chapterId)) {
+        return { kind: 'unexpected', reason: 'target_chapter_not_found' };
+      }
+      await agent.openChapter(target.chapterId);
+      return { kind: 'navigated' };
+    }
+    if (!target.enrollmentKey || !playerRoute(new URL(observedUrl))) {
+      return { kind: 'unexpected', reason: 'course_recovery_route_unverified' };
+    }
+    const candidates = await Promise.all(recoveryLinks().slice(0, maxRecoveryCandidates).map(async (candidate) => ({
+      id: await digest(JSON.stringify([candidate.href, candidate.title])), ...candidate
+    })));
+    if (location.href !== observedUrl) return { kind: 'wait', reason: 'course_page_changed' };
+    if (operation === 'discoverRecovery') {
+      return { kind: 'candidates', candidates: candidates.map(({ id, title, chapterId }) => ({ id, title, chapterId })) };
+    }
+    const selected = candidates.find(({ id }) => id === candidateId);
+    if (!selected) return { kind: 'unexpected', reason: 'recovery_candidate_unavailable' };
+    const latest = await agent.inspect();
+    const latestIssue = verify(latest) || verifyNavigation(latest);
+    if (latestIssue) return latestIssue;
+    if (location.href !== observedUrl) return { kind: 'wait', reason: 'course_page_changed' };
+    if (!recoveryLinks().some(({ href, title }) => href === selected.href && title === selected.title)) {
+      return { kind: 'unexpected', reason: 'recovery_candidate_unavailable' };
+    }
+    return { kind: 'recovery_href', href: selected.href };
+  }
   if (!before.observation.course || before.unavailableFrames.length > 0) {
     return { kind: 'wait', reason: 'course_frames_unavailable' };
   }
@@ -130,7 +243,7 @@ async function observeCourse({ operation, target }) {
   return observed(await agent.inspect());
 }
 
-async function run({ operation, target }) {
+async function run({ operation, target, candidateId, maxRecoveryCandidates }) {
   const space = (await listTaskSpaces()).find((item) => item.id === target.spaceId);
   if (!space) return { kind: 'wait', reason: 'space_unavailable' };
   if (space.ownership !== 'agent') return { kind: 'user', reason: 'space_needs_agent_control' };
@@ -162,7 +275,16 @@ async function run({ operation, target }) {
   const addressIssue = addressState(currentUrl);
   if (addressIssue) return addressIssue;
 
-  let result = await page.evaluate(observeCourse, { operation, target });
+  let result = await page.evaluate(observeCourse, { operation, target, candidateId, maxRecoveryCandidates });
+  if (result?.kind === 'recovery_href' && operation === 'followRecovery') {
+    if (await page.url() !== currentUrl) return { kind: 'wait', reason: 'course_page_changed' };
+    try {
+      await page.goto(result.href, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    } catch (error) {
+      if (!/timeout|timed out|ERR_ABORTED/i.test(String(error?.message ?? error))) throw error;
+    }
+    return { kind: 'navigated' };
+  }
   if (result?.kind === 'observed' && operation === 'refresh') {
     if (result.value.observation.blockedReason ||
         result.value.frames.some(({ status }) => ['starting', 'running', 'waiting_for_user'].includes(status.state)) ||
@@ -209,13 +331,37 @@ function commandFailure(output) {
 	return { kind: 'wait', reason: 'ego_browser_unavailable' };
 }
 
-function readResult(output) {
+function readResult(output, operation) {
 	const line = output.split('\n').findLast((part) => part.startsWith(RESULT_PREFIX));
 	if (!line) return { kind: 'unexpected', reason: 'missing_ego_browser_result' };
 	try {
 		const result = JSON.parse(line.slice(RESULT_PREFIX.length));
 		if (result?.kind === 'observed' && result.value && typeof result.profileId === 'string') return result;
 		if (['wait', 'user', 'unexpected'].includes(result?.kind) && typeof result.reason === 'string') return result;
+		if (['openChapter', 'followRecovery'].includes(operation) && result?.kind === 'navigated') {
+			return { kind: 'navigated' };
+		}
+		if (
+			operation === 'discoverRecovery' &&
+			result?.kind === 'candidates' &&
+			Array.isArray(result.candidates) &&
+			result.candidates.length <= MAX_RECOVERY_CANDIDATES &&
+			result.candidates.every(
+				(candidate) =>
+					typeof candidate?.id === 'string' &&
+					RECOVERY_CANDIDATE_ID.test(candidate.id) &&
+					typeof candidate.title === 'string' &&
+					candidate.title.length > 0 &&
+					candidate.title.length <= 160 &&
+					(candidate.chapterId === null ||
+						(typeof candidate.chapterId === 'string' && CHAPTER_ID.test(candidate.chapterId)))
+			)
+		) {
+			return {
+				kind: 'candidates',
+				candidates: result.candidates.map(({ id, title, chapterId }) => ({ id, title, chapterId }))
+			};
+		}
 	} catch {
 		// Command output never enters workflow logs or model context.
 	}
@@ -278,7 +424,7 @@ function runBrowser(executable, input, signal) {
 		});
 		child.on('close', (code) => {
 			const output = `${stdout}\n${stderr}`;
-			finish(termination ?? (code === 0 ? readResult(output) : commandFailure(output)));
+			finish(termination ?? (code === 0 ? readResult(output, input.operation) : commandFailure(output)));
 		});
 		child.stdin.on('error', () => {
 			// The child exit supplies the outcome if it closes the input pipe early.
@@ -289,7 +435,7 @@ function runBrowser(executable, input, signal) {
 }
 
 export function createEgoBrowser({ executable = 'ego-browser' } = {}) {
-	const act = async (operation, target, signal) => {
+	const act = async (operation, target, signal, candidateId) => {
 		const { spaceId, page, profileId, taskId, courseId, clazzId, chapterId, enrollmentKey } = target ?? {};
 		const identifiers = [profileId, taskId, courseId, clazzId, chapterId];
 		if (
@@ -299,13 +445,20 @@ export function createEgoBrowser({ executable = 'ego-browser' } = {}) {
 			!/^p[1-9]\d*$/.test(page) ||
 			identifiers.some((id) => id !== undefined && (typeof id !== 'string' || !id.trim() || id.length > 256)) ||
 			(enrollmentKey !== undefined && (typeof enrollmentKey !== 'string' || !/^[0-9a-f]{64}$/.test(enrollmentKey))) ||
+			(operation === 'followRecovery' &&
+				(typeof candidateId !== 'string' || !RECOVERY_CANDIDATE_ID.test(candidateId))) ||
 			(operation !== 'inspect' && identifiers.some((id) => id === undefined))
 		) {
 			return { kind: 'user', reason: 'invalid_browser_target' };
 		}
 		return runBrowser(
 			executable,
-			{ operation, target: { spaceId, page, profileId, taskId, courseId, clazzId, chapterId, enrollmentKey } },
+			{
+				operation,
+				target: { spaceId, page, profileId, taskId, courseId, clazzId, chapterId, enrollmentKey },
+				candidateId,
+				maxRecoveryCandidates: MAX_RECOVERY_CANDIDATES
+			},
 			signal
 		);
 	};
@@ -313,6 +466,9 @@ export function createEgoBrowser({ executable = 'ego-browser' } = {}) {
 		inspect: (target, signal) => act('inspect', target, signal),
 		start: (target, signal) => act('start', target, signal),
 		resume: (target, signal) => act('resume', target, signal),
-		refresh: (target, signal) => act('refresh', target, signal)
+		refresh: (target, signal) => act('refresh', target, signal),
+		openChapter: (target, signal) => act('openChapter', target, signal),
+		discoverRecovery: (target, signal) => act('discoverRecovery', target, signal),
+		followRecovery: (target, candidateId, signal) => act('followRecovery', target, signal, candidateId)
 	};
 }
